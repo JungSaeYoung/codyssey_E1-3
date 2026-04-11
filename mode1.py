@@ -1,14 +1,13 @@
 # mode1.py
 # ─────────────────────────────────────────────────────────────────────────────
-# 모드 1: 사용자 입력 (3×3) 모드.
+# 모드 1: 사용자 입력 모드.
 #
-# 흐름:
-#   1. 필터 A(3×3) 입력 받기
-#   2. 필터 B(3×3) 입력 받기
-#   3. 패턴 (3×3) 입력 받기
-#   4. mac_2d 로 두 점수 산출
-#   5. epsilon 동점 처리 → A승 / B승 / UNDECIDED 출력
-#   6. 10회 평균 연산 시간(ms) 출력
+# 두 가지 진입점:
+#   run()                — 과제 필수: 3×3 고정. 두 필터와 패턴을 모두 사용자가 입력.
+#   run_with_filters()   — 보너스 2 연동: 필터 A/B 가 미리 주어지고(예: pattern_gen
+#                          으로 만든 N×N Cross/X), 사용자는 N×N 패턴만 입력.
+#
+# 두 진입점 모두 내부 _judge_and_print() 으로 통일된 결과 출력을 거친다.
 # ─────────────────────────────────────────────────────────────────────────────
 
 import time
@@ -88,33 +87,63 @@ def _benchmark_once(A, B, repeats=10):
 
 
 def run():
-    """모드 1의 진입점. main.py 에서 호출된다."""
+    """모드 1의 기본 진입점 — 과제 필수 사양인 3×3 고정 입력."""
     print("\n=== 모드 1: 사용자 입력 (3×3) ===")
     n = 3
 
-    # 1) 두 필터와 패턴을 차례로 입력 받는다.
+    # 두 필터와 패턴을 차례로 입력 받는다.
     A = _read_grid("필터 A", n)
     B = _read_grid("필터 B", n)
     P = _read_grid("패턴", n)
 
-    # 2) 각 필터와 패턴의 MAC 점수 — 10회 평균 시간도 함께 측정
+    _judge_and_print(A, B, P, "필터 A", "필터 B")
+
+
+def _judge_and_print(A, B, P, label_a, label_b):
+    """공용 결과 출력 헬퍼.
+
+    필터 A/B 와 패턴 P 가 모두 준비된 상태에서 호출된다.
+    두 진입점(run / run_with_filters) 모두 이 함수를 거쳐 출력 형식이 통일된다.
+    """
+    # 1) 각 필터와 패턴의 MAC 점수 — 10회 평균 시간도 함께 측정
     score_a, avg_a_ms = _benchmark_once(A, P, repeats=10)
     score_b, avg_b_ms = _benchmark_once(B, P, repeats=10)
 
-    # 3) 결과 출력
+    # 2) 결과 출력
     print("\n--- 결과 ---")
-    print(f"필터 A 점수: {score_a}")
-    print(f"필터 B 점수: {score_b}")
+    print(f"{label_a} 점수: {score_a}")
+    print(f"{label_b} 점수: {score_b}")
 
-    # 4) epsilon 기반 동점 처리
+    # 3) epsilon 기반 동점 처리
     diff = score_a - score_b
     if abs(diff) < EPSILON:
         verdict = "UNDECIDED (판정 불가, 두 점수가 거의 동일)"
     elif diff > 0:
-        verdict = "필터 A 와 더 닮음"
+        verdict = f"{label_a} 와 더 닮음"
     else:
-        verdict = "필터 B 와 더 닮음"
+        verdict = f"{label_b} 와 더 닮음"
     print(f"판정: {verdict}")
 
-    # 5) 평균 연산 시간(10회 평균)
-    print(f"평균 연산 시간(10회): A={avg_a_ms:.6f} ms, B={avg_b_ms:.6f} ms")
+    # 4) 평균 연산 시간 (10회 평균)
+    print(f"평균 연산 시간(10회): {label_a}={avg_a_ms:.6f} ms, {label_b}={avg_b_ms:.6f} ms")
+
+
+def run_with_filters(A, B, n, label_a="Cross", label_b="X"):
+    """보너스 2 연동: 필터 A/B 가 이미 주어진 상태에서 패턴만 입력 받는다.
+
+    main.py 의 메뉴 5번(패턴 생성기)에서 호출된다. 사용자가 N 을 골라
+    pattern_gen 으로 Cross/X 를 만든 뒤, 그것을 필터로 그대로 넘겨주는 흐름.
+
+    Args:
+        A: 필터 A (보통 Cross). N×N 2차원 리스트.
+        B: 필터 B (보통 X). N×N 2차원 리스트.
+        n: 격자 크기. _read_grid 에 그대로 전달된다.
+        label_a, label_b: 결과 출력에 사용할 필터 이름.
+    """
+    print(f"\n=== 모드 1 (필터 사전 제공, N={n}) ===")
+    print(f"필터 A = {label_a}, 필터 B = {label_b} (자동 생성된 N×N 패턴)")
+
+    # 사용자는 패턴만 입력하면 된다.
+    P = _read_grid("패턴", n)
+
+    _judge_and_print(A, B, P, label_a, label_b)
