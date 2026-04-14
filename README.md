@@ -238,6 +238,68 @@ bitwise 트릭은 "패킹 비용을 어디서 치르느냐"에 따라 성능이 
 - **per-call (자동)**: 메뉴 `4)` 로 버전을 `bitwise` 로 바꾸면, `mac_2d(A, B)` 호출마다 두 격자를 패킹합니다. 패킹 자체가 파이썬 루프이므로 N이 작을 때는 baseline 보다 오히려 느립니다. 일반성·투명성을 위한 기본 모드.
 - **pre-packed (수동)**: `pack_grid()` 로 격자를 미리 정수로 변환해두고 `mac_packed(pa, pb)` 를 호출하면, 측정 구간에 남는 연산은 `(pa & pb).bit_count()` 단 한 줄. N=25 에서 baseline 대비 200배 이상 빠릅니다. 같은 필터를 여러 번 재사용하는 mode2 같은 시나리오에서 이상적.
 
+### 왜 1D 와 2D MAC 을 따로 두었나 (보너스 1 의 의도)
+
+[mac.py](mac.py) 는 각 버전마다 **2D 진입점**(`_mac_2d_*`) 과 **1D 진입점**(`_mac_1d_*`) 을
+쌍으로 제공한다. 수학적으로는 MAC 이 "위치별 곱의 합" 이라 차원에 무관한데,
+왜 굳이 둘로 나누어 두었을까?
+
+#### (1) 표현 vs 연산의 관심사 분리
+
+- **2D** 는 **사람이 문제를 이해하기 위한 표현** 이다. 이미지가 2D 격자고, Cross/X
+  필터도 2D 로 그려야 "가운데 행+열", "두 대각선" 같은 의미가 눈에 들어온다.
+  `data.json` 의 `input` 도, 사용자가 키보드로 입력하는 모드 1 도, 모두 2D 다.
+- **1D** 는 **기계가 연산하기 위한 표현** 이다. 컴퓨터의 메모리는 본질적으로
+  1차원이고, 캐시·레지스터·SIMD 유닛 모두 연속된 바이트 열을 선호한다.
+  `flatten()` 한 번으로 2D 의 논리 구조를 유지한 채 연산용 형태로 넘긴다.
+
+즉 **입력은 2D 로 받고, 연산은 1D 로 수행** 하는 분리를 명시적으로 보여준다.
+`pack_grid()` 가 그 극단이다 — 2D 격자를 단일 정수 하나(본질적으로 0차원 비트열)로
+압축해 AND 한 번으로 MAC 을 끝낸다.
+
+#### (2) 실제 NPU/GPU 파이프라인의 축소판
+
+이 분리는 현실의 추론 가속 하드웨어에서 일어나는 일을 그대로 반영한다.
+
+```
+  실제 CNN 추론                    이 프로젝트의 대응
+  ─────────────────────────       ────────────────────
+  이미지 / 커널 (2D, 2D)           격자 / 필터 (2D, 2D)
+         │                              │
+         ▼ im2col (flatten)             ▼ flatten()
+  1D 벡터의 집합                   1D 리스트
+         │                              │
+         ▼ GEMM (행렬곱)                ▼ mac_1d / mac_packed
+  출력 tensor                      MAC 결과
+```
+
+실제 GPU/NPU 는 2D conv 를 바로 처리하지 않고 **im2col** 이라는 변환으로 2D 커널과
+수용영역(receptive field)들을 1D 벡터로 펼친 뒤 **GEMM(행렬곱)** 으로 돌린다. 이유는
+정확히 같다: 하드웨어가 연속 메모리 접근에 최적화돼 있기 때문. 이 프로젝트의 `flatten`
+→ `mac_1d` 경로는 그 파이프라인의 축소판이다.
+
+#### (3) 벤치마크 실험대 — "평탄화가 언제 이득인가" 를 실측으로 보기
+
+1D/2D 를 둘 다 두었기 때문에, 같은 알고리즘을 같은 입력에 적용한 결과를 공정하게
+비교할 수 있다. 그 결과가 위 "버전 비교" 표와 "1D vs 2D 비교" 표이고,
+**"어느 쪽이 항상 빠르다" 가 아니라 "구현과 N 에 따라 다르다"** 는 비자명한 결론으로
+이어졌다(아래 타 프로젝트 교차 검증 참고).
+
+이것이 보너스 1 의 진짜 의도다: **같은 수학 연산이라도 표현과 메모리 배치를 바꾸면
+성능이 어떻게 달라지는지 수치로 체감하는 것.**
+
+#### (4) 각 버전이 2D/1D 쌍을 갖는 이유
+
+| 버전 | 2D 함수 | 1D 함수 | 쌍을 둔 이유 |
+|---|---|---|---|
+| baseline | `_mac_2d_baseline` | `_mac_1d_baseline` | 차원만 바꿨을 때의 순수 효과 측정 (결론: 거의 없음) |
+| sumprod | `_mac_2d_sumprod` | `_mac_1d_sumprod` | 2D 는 행 단위 sumprod 를 N번, 1D 는 sumprod 1번 → 루프 횟수 차이가 드러남 |
+| bitwise | `_mac_2d_bitwise` | `_mac_1d_bitwise` | 1D 는 이미 평탄화된 상태니 `pack` 비용이 약간 줄어듬. 실용 가치보다는 대칭을 위해 존재 |
+
+dispatch 함수 `mac_2d` / `mac_1d` 도 이에 맞춰 두 개다. 호출자는 입력이 2D 리스트면
+`mac_2d` 를, flatten 된 상태면 `mac_1d` 를 부르면 된다 — **어느 쪽으로 불러도
+현재 선택된 버전에 맞는 구현이 자동으로 실행된다.**
+
 ### 라벨 정규화 정책
 - [data_loader.py](data_loader.py) 의 `normalize_label()` 이 담당.
 - 입력 문자열은 `strip().lower()` 로 정리한 뒤 매핑한다 → 대소문자 차이를 흡수.
@@ -315,6 +377,203 @@ Python 3.12 부터 [`math.sumprod(a, b)`](https://docs.python.org/3/library/math
 3. **0/1 입력 한정 fast-path** — `data.json` 로드 직후 모든 값이 {0, 1} 이면 자동으로 `mac_packed` 경로로 분기 (필터·패턴 모두 사전 패킹).
 
 이 세 가지만 적용해도 25×25 mode 2 전체 시간이 사실상 측정 잡음 아래로 내려갑니다.
+
+---
+
+## 병렬 처리 vs 직렬 처리
+
+### 먼저: 주방 비유로 직관 잡기
+
+625개의 샌드위치(= N=25 의 MAC 총 연산 수)를 만들어야 한다고 해보자.
+
+| 세 가지 버전 | 주방 비유 | 실제 코드에서 |
+|---|---|---|
+| **baseline** | 혼자서 식빵 하나 집고, 속재료 하나 얹고, 덮고 자르고... 를 625번 반복 | 파이썬 for-loop 로 곱셈을 한 번에 하나씩 |
+| **sumprod** | 자동 샌드위치 기계가 한 개씩 만들지만 사람보다 3배 빠름 | C 레벨 루프로 여전히 하나씩, 그러나 파이썬 해석 오버헤드가 사라짐 |
+| **bitwise** | 컨베이어 벨트에 **64개 샌드위치를 한 줄로 올려놓고 한꺼번에 찍어낸다** | CPU 의 AND 명령어 한 번이 64비트(=64개의 곱)를 동시 처리 |
+
+결론: bitwise 가 228배 빠른 이유는 "더 열심히 일해서" 가 아니라
+**"한 번에 64개씩 처리하는 기계가 파이썬 기본 연산자 뒤에 숨어 있기 때문"** 이다.
+
+### 세 버전을 시간축에 놓으면
+
+```mermaid
+graph LR
+    subgraph b["baseline — 625개를 하나씩"]
+        direction LR
+        B1[곱 1] --> B2[곱 2] --> B3[곱 3] --> B4[...] --> Bn[곱 625]
+    end
+    subgraph s["sumprod — 625개를 하나씩, 그러나 C 속도"]
+        direction LR
+        S1[곱 1] --> S2[곱 2] --> S3[...] --> Sn[곱 625]
+    end
+    subgraph w["bitwise — 64개씩 동시에, 10~20 스텝이면 끝"]
+        direction LR
+        W1[AND<br/>64개 동시] --> W2[POPCNT<br/>64개 동시] --> W3[... 10쌍 반복]
+    end
+```
+
+아래 그림은 같은 이야기를 타임라인으로 나타낸 것이다 — 각 막대 하나가 한 "스텝" 이다.
+
+![병렬 타임라인](docs/images/parallel_timeline.png)
+
+baseline 과 sumprod 는 막대가 625개 필요하고 (직렬), bitwise 는 10~20개면 된다 (병렬).
+
+### 코드 세 줄로 보는 차이
+
+같은 "MAC 625번" 인데 최종 파이썬 코드 형태는 이렇게 다르다:
+
+```python
+# ─── baseline : 완전 직렬 ───
+for i in range(n):
+    for j in range(n):
+        total += A[i][j] * B[i][j]   # 한 반복에 곱 1개  (× 625번)
+
+# ─── sumprod : 여전히 직렬, 한 스텝 비용만 절감 ───
+total = sum(math.sumprod(ra, rb) for ra, rb in zip(A, B))
+#             └─ C 레벨 루프 한 번에 N 개 처리 (하지만 내부는 여전히 순차)
+
+# ─── bitwise : 하드웨어 비트 병렬 ───
+total = (pa & pb).bit_count()
+#        └─────┘  └─────────┘
+#        AND 1회  POPCNT 1회
+#        N² ≤ 64 면 이 한 줄이 전부. 그보다 크면 limb 단위로 몇 번만 더.
+```
+
+세 줄의 길이는 비슷한데 **"한 줄 뒤에서 CPU 가 얼마나 많은 곱을 동시에 처리하는가"** 가 다르다.
+
+### bitwise 의 내부 — 단계별 애니메이션
+
+`(pa & pb).bit_count()` 가 어떻게 "64개 곱을 동시" 로 바뀌는지 N=4 격자를 예로 따라가보자
+(실제로는 N=8 까지가 64비트 한 워드에 들어가지만, 그림은 16비트로 축약).
+
+**Step 0 — 격자를 비트로 패킹 (`pack_grid`)**
+
+```
+ Cross (4x4)              X (4x4)
+   0 0 1 0                  1 0 0 1
+   0 1 1 0                  0 1 1 0
+   0 1 1 0                  0 1 1 0
+   0 0 1 0                  1 0 0 1
+     │                        │
+     ▼ 행 우선으로 펴기         ▼
+  pa = 0b 0010 0110 0110 0010       pb = 0b 1001 0110 0110 1001
+```
+
+pa, pb 는 이제 **16비트 정수 하나씩**. 파이썬이 보기엔 그냥 `int` 객체.
+
+**Step 1 — AND 한 번으로 16개 곱을 동시에**
+
+```
+  pa   :  0 0 1 0  0 1 1 0  0 1 1 0  0 0 1 0
+  pb   :  1 0 0 1  0 1 1 0  0 1 1 0  1 0 0 1
+  ──────────────────────────────────────────────  ← CPU 의 AND 명령어 1회
+  pa&pb:  0 0 0 0  0 1 1 0  0 1 1 0  0 0 0 0
+
+  (각 열이 독립적으로 AND 됨 — 16개 곱셈이 "동시에" 일어남)
+```
+
+파이썬 소스 `pa & pb` 한 표현식이 C 코드 → 기계어 `AND reg1, reg2` 단 1개로 컴파일된다.
+그 한 명령어가 CPU 내부에서 16개(또는 64개) 비트쌍을 **병렬로** AND 한다.
+
+**Step 2 — bit_count 한 번으로 16개 덧셈을 동시에**
+
+```
+  pa&pb:  0 0 0 0  0 1 1 0  0 1 1 0  0 0 0 0
+            │
+            ▼  .bit_count()  (x86-64 의 POPCNT 명령어 1회)
+            
+  결과:  4     ← 1 의 개수 = Cross 와 X 가 동시에 1인 셀 수 = MAC 결과
+```
+
+POPCNT 도 마찬가지로 16(또는 64)비트를 **한 사이클에 동시** 로 센다.
+
+**정리**: N=4 MAC(16 번의 곱+합) 이 기계어 **2개** 로 끝난다.
+baseline 이라면 파이썬 바이트코드 사이클 기준 16 × (오버헤드 수십~수백) 이 필요하다.
+
+### 시간 복잡도 시각 비교
+
+```
+                 N=25 (N² = 625) 일 때
+                 ─────────────────────
+
+  baseline     [■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■] 625 스텝
+                 (각 스텝 = 파이썬 바이트코드 사이클, 수십~수백 기계어)
+
+  sumprod      [■■■■■■■■■■■■■■■■■■■■■■■■] 625 스텝 (C 루프)
+                 (각 스텝 = C 함수 한 이터, baseline 보다 가벼움)
+
+  bitwise      [■■■■] 10 스텝 (AND) + [■■■■] 10 스텝 (POPCNT) = 20 스텝
+                 (각 스텝 = 기계어 1개가 64비트 병렬 처리)
+```
+
+이 20 스텝이 228배 빠른 이유다.
+
+### 실측 — 네 경우의 벤치마크를 한눈에
+
+![버전 비교 차트](docs/images/version_comparison.png)
+
+**왼쪽 차트 — 호출당 절대 시간 (로그 스케일 막대 그래프).**
+baseline(파랑) 은 N 이 커질수록 약 **25 배** (0.001ms → 0.025ms) 늘어난다. 다만 로그
+스케일이라 시각적으로는 완만해 보일 뿐 실제로는 확실히 증가한다. bitwise (pre-packed, 빨강) 는
+다른 버전보다 2~3 자릿수 낮은 시간을 일정하게 유지한다.
+
+**오른쪽 차트 — baseline 대비 속도배 (로그 스케일 라인 그래프).**
+아래쪽의 파란 점선이 **baseline 자기 자신** 인데, 속도배의 정의상
+`baseline_time / baseline_time = 1.0` 이라 **항상 1.0 에 수평** 으로 그려진다.
+즉 "baseline 이 성능이 일정하다" 는 뜻이 아니라 **"비교 기준선이라 수학적으로 1.0 에
+고정된다"** 는 뜻이다. 실제 baseline 의 시간 증가는 왼쪽 차트에서 볼 수 있다.
+
+오른쪽 차트에서 진짜 정보는 **다른 세 색의 선** 이다:
+- **sumprod** (초록): N 이 커질수록 baseline 대비 이득이 **벌어진다** (1.0x → 2.3x). C 루프의 스텝 비용이 파이썬 오버헤드를 점점 더 크게 상회함.
+- **bitwise (pre-packed)** (빨강): **15x → 228x** 로 기하급수적 이득. 한 AND/POPCNT 가 64 개의 곱을 동시에 처리하므로 N² 이 커질수록 격차가 폭발.
+- **bitwise (per-call)** (주황): baseline 보다 **아래** 에 있음 = **느리다**. 호출마다 하는 패킹 비용이 이득을 압도.
+
+### 왜 `threading` / `multiprocessing` 은 안 썼는가
+
+흔히 "병렬화" 하면 떠올리는 `threading`, `multiprocessing`, `concurrent.futures` 는
+stdlib 에 다 들어있다. **그럼에도 이 프로젝트에 적용하지 않은 것은 의도적이다.**
+
+```mermaid
+flowchart TD
+    Q["MAC 을 병렬화하고 싶다"] --> A{어떤 방법?}
+    A -->|threading| T["CPython 에는 GIL<br/>한 번에 한 스레드만<br/>바이트코드 실행<br/>→ CPU-bound 작업은<br/>실제 병렬 안 됨"]
+    A -->|multiprocessing| M["진짜 병렬이지만<br/>프로세스 생성 수십ms<br/>pickle 직렬화 비용<br/>→ MAC 1번 1ms 인데<br/>셋업만 100ms 낭비"]
+    A -->|asyncio| AS["I/O 대기용 도구<br/>→ 순수 CPU 연산엔<br/>효과 없음"]
+    A -->|bitwise| W["CPU 의 AND/POPCNT 가<br/>이미 64비트 병렬<br/>→ 셋업 비용 0<br/>→ 파이썬 한 줄로 접근"]
+    T --> X["❌ 손해"]
+    M --> X
+    AS --> X
+    W --> V["✅ 이 프로젝트의 선택"]
+```
+
+구체적인 수치:
+
+| 접근 | 예상 이득 | 예상 비용 | 순수익 |
+|---|---|---|---|
+| `threading` (4 스레드) | 1x (GIL 로 실제 병렬 0) | 컨텍스트 스위칭 | **손해** |
+| `multiprocessing` (4 프로세스) | 4x | 풀 생성 > 100ms, pickle ms 단위 | 12개 패턴 0.3ms 작업엔 **손해** |
+| `asyncio` | 없음 | 이벤트 루프 오버헤드 | **손해** |
+| `bitwise` (AND+POPCNT) | **64x 이상** | 패킹 비용만 (재사용 시 0) | **압도적 이득** |
+
+즉 **"명시적 병렬화가 아니라 CPU 가 이미 가진 비트 병렬성을 끌어다 쓰는 것"** 이
+이 프로젝트 규모에서의 최적해다.
+
+### 요약 표 — 버전별 병렬성 스펙트럼
+
+| 버전 | 한 "스텝" 의 정체 | 병렬성 | 한 스텝이 처리하는 곱의 수 | N=25 총 스텝 |
+|---|---|---|---|---|
+| **baseline** | 파이썬 바이트코드 사이클 | 없음 | 1 | 625 |
+| **sumprod** | C 함수의 한 이터레이션 | 없음 | 1 | 625 |
+| **bitwise (per-call)** | 패킹 파이썬 루프 + AND + POPCNT | 64비트 하드웨어 | 64 | ~1250 (패킹이 지배) |
+| **bitwise (pre-packed)** | AND 1회 + POPCNT 1회 (limb 당) | 64비트 하드웨어 | 64 | **20** |
+| *threading (미적용)* | *(GIL 로 인해 직렬)* | *없음* | *1* | *625* |
+| *multiprocessing (미적용)* | *프로세스 간 분산* | *프로세스 수* | *분산 가능* | *통신 비용 > 작업* |
+
+### 한 줄 결론
+
+> **228×의 진짜 의미**: "같은 일을 빠르게" 가 아니라, **"한 번에 64개를 처리하기 시작했기 때문".**
+> 이것이 MAC 이 중요한 이유이자, NPU 가 존재하는 이유다.
 
 ---
 
@@ -649,6 +908,324 @@ N 입력 (예: 7) > 5
 ```
 
 이 시나리오를 따라 하면 (a) 동일한 입력이 세 구현에서 같은 결과를 낸다는 것, (b) 보너스 2 의 패턴 생성기가 mode1·벤치마크와 자연스럽게 연결된다는 것을 직접 확인할 수 있습니다.
+
+---
+
+## 핵심 코드 해설 (Deep Dive)
+
+"동작 흐름" 이 프로그램 전체의 조감도였다면, 이 섹션은 **개별 함수 안으로 줌인** 해서
+코드 몇 줄이 실제로 어떻게 동작하는지 예제 값으로 한 단계씩 따라간다.
+특히 비자명하거나 설계 의도가 숨어있는 여섯 함수를 골랐다.
+
+### 1. `pack_grid` — 2D 격자를 단일 정수 한 개로 압축
+
+bitwise 버전의 심장. N×N 0/1 격자를 길이 N² 의 비트열로 이어 붙여
+**정수 객체 단 한 개** 로 만든다.
+
+```python
+# mac.py
+def pack_grid(grid):
+    bits = 0
+    for row in grid:
+        for v in row:
+            bits = (bits << 1) | (1 if v else 0)
+    return bits
+```
+
+**핵심 한 줄**: `bits = (bits << 1) | (1 if v else 0)`
+
+- `bits << 1` — 지금까지 쌓인 비트들을 왼쪽으로 한 칸 민다 → 오른쪽 끝(LSB)에 0 한 칸의 자리가 생김
+- `(1 if v else 0)` — 새 셀 값을 0 또는 1 로 정규화
+- `|` — 비어있는 자리(LSB)에 새 비트를 끼워 넣음
+
+N=3 Cross 격자로 한 단계씩 따라가보자.
+
+```
+Cross 3x3:         단계별 bits 값 (이진 표기)
+  0 1 0            초기값 :       0b            = 0
+  1 1 1                                       (len=0)
+  0 1 0            0 읽음 :       0b         0 = 0    (len=1)
+                   1 읽음 :       0b        01 = 1    (len=2)
+                   0 읽음 :       0b       010 = 2    (len=3, 1행 완료)
+                   1 읽음 :       0b      0101 = 5
+                   1 읽음 :       0b     01011 = 11
+                   1 읽음 :       0b    010111 = 23   (len=6, 2행 완료)
+                   0 읽음 :       0b   0101110 = 46
+                   1 읽음 :       0b  01011101 = 93
+                   0 읽음 :       0b 010111010 = 186  (len=9, 끝)
+```
+
+최종 `pack_grid(cross_3x3)` → **186** (이진으로 `0b010111010`, 9비트).
+
+격자의 "1이 있는 위치" 가 정수의 "1이 선 비트 위치" 로 일대일 대응된다. 행 우선·MSB 부터
+쌓는 규칙만 pattern/filter 양쪽에서 동일하게 유지하면, 두 정수의 비트가 **위치별로
+정확히 겹쳐** 비교 가능해진다.
+
+왜 중요? 이 규칙 덕분에 아래 `mac_packed` 의 AND 연산 한 줄로 "위치별 동시 곱" 이
+자동으로 이루어진다.
+
+---
+
+### 2. `mac_packed` — MAC 을 한 줄로 끝내는 마법
+
+```python
+# mac.py
+def mac_packed(pa, pb):
+    return (pa & pb).bit_count()
+```
+
+이 두 표현식이 MAC 의 전부인 이유를 예제로 본다.
+
+```
+Cross 3x3        X 3x3
+  0 1 0            1 0 1
+  1 1 1            0 1 0
+  0 1 0            1 0 1
+
+pack_grid(Cross) → pa = 0b 010_111_010 = 186
+pack_grid(X)     → pb = 0b 101_010_101 = 341
+
+Step 1:  pa & pb   (CPU 의 AND 명령어 — 9 비트 동시 처리)
+
+   pa :   0 1 0 | 1 1 1 | 0 1 0
+   pb :   1 0 1 | 0 1 0 | 1 0 1
+ ─────────────────────────────── AND
+ pa&pb:   0 0 0 | 0 1 0 | 0 0 0   = 0b000_010_000 = 16
+
+(각 비트 자리마다 '동시에 1인가?' 를 독립적으로 계산 → 이게 바로 '위치별 곱')
+
+Step 2:  .bit_count()   (POPCNT 명령어 — 1의 개수 세기)
+
+   0b000_010_000 에는 1이 1개  →  MAC 결과 = 1
+```
+
+**해석**: Cross 와 X 는 "정중앙 셀" 한 곳에서만 겹치므로 MAC = 1. 이 결과는 baseline
+이나 sumprod 로 계산해도 정확히 같다. 차이는 **과정의 스텝 수** 뿐이다 (baseline 9회의
+파이썬 곱셈 vs bitwise 기계어 2개).
+
+왜 0/1 입력에서만 동작? 곱셈 `a × b` 를 논리 AND 로 바꾸려면 `a, b ∈ {0, 1}` 이어야 한다
+(`1×1=1`, `1×0=0`, `0×0=0` 이 AND 와 일치). 2 나 0.5 같은 값은 이 트릭이 안 통한다.
+그래서 `_mac_2d_bitwise` 는 입력이 0/1 이 아니면 `_is_binary_grid` 검사 후
+`_mac_2d_sumprod` 로 **자동 폴백** 한다.
+
+---
+
+### 3. `flatten` — 이중 리스트 컴프리헨션 이디엄
+
+```python
+# mac.py
+def flatten(M):
+    return [M[i][j] for i in range(len(M)) for j in range(len(M[i]))]
+```
+
+2×3 예제로 한 단계씩:
+
+```
+M = [[1, 2, 3],
+     [4, 5, 6]]
+
+i=0 시작:
+  j=0:  M[0][0] = 1  → result = [1]
+  j=1:  M[0][1] = 2  → result = [1, 2]
+  j=2:  M[0][2] = 3  → result = [1, 2, 3]
+i=1 시작:
+  j=0:  M[1][0] = 4  → result = [1, 2, 3, 4]
+  j=1:  M[1][1] = 5  → result = [1, 2, 3, 4, 5]
+  j=2:  M[1][2] = 6  → result = [1, 2, 3, 4, 5, 6]
+```
+
+**왜 리스트 컴프리헨션인가?** 동등한 일반 for-loop 을 풀어 써보면:
+
+```python
+result = []
+for i in range(len(M)):
+    for j in range(len(M[i])):
+        result.append(M[i][j])
+return result
+```
+
+두 코드는 결과가 같지만, 컴프리헨션은 CPython 이 `LIST_APPEND` 바이트코드로 최적화해
+약 20~30% 더 빠르다. 가독성도 좋아서 파이썬에서 **"평탄화 = 이중 for 컴프리헨션"** 이
+관용구로 굳어졌다.
+
+**더 관용적인 대안** (stdlib 만):
+
+```python
+from itertools import chain
+return list(chain.from_iterable(M))
+```
+
+`chain.from_iterable` 은 C 이터레이터로 구현되어 있어 이론적으로 더 빠를 수 있지만,
+이 프로젝트에서는 벤치마크에 영향 없는 수준이고 "리스트 컴프리헨션" 이 초심자에게
+더 읽기 쉬워 현재 형태를 유지했다.
+
+---
+
+### 4. `_mac_2d_baseline` — 한 줄의 row 캐싱이 만드는 차이
+
+```python
+# mac.py
+def _mac_2d_baseline(A, B):
+    n = _validate_2d(A, B)
+    total = 0
+    for i in range(n):
+        row_a = A[i]    # ← 이 한 줄
+        row_b = B[i]    # ← 이 한 줄
+        for j in range(n):
+            total += row_a[j] * row_b[j]
+    return total
+```
+
+`row_a = A[i]` 두 줄을 빼면 내부 루프가 이렇게 된다:
+
+```python
+# 캐싱 없는 버전 (저쪽 프로젝트 스타일)
+for i in range(n):
+    for j in range(n):
+        total += A[i][j] * B[i][j]
+```
+
+겉보기엔 같은 코드지만 **내부 루프의 매 iteration 에서 하는 일이 다르다**:
+
+```
+            캐싱 있음                     캐싱 없음
+          (row_a[j] 접근)               (A[i][j] 접근)
+
+BINARY_SUBSCR row_a, j                LOAD_NAME A
+                                      LOAD_FAST  i
+                                      BINARY_SUBSCR      ← A[i]
+                                      LOAD_FAST  j
+                                      BINARY_SUBSCR      ← [j]
+
+ → 1번의 리스트 인덱싱                  → 2번의 리스트 인덱싱
+```
+
+내부 루프가 N² 번 도니까, 캐싱 없는 버전은 N² × 2번의 추가 인덱싱을 한다.
+25×25 이면 625 번이 1250 번이 되는 것. "타 프로젝트와의 교차 검증" 섹션에서 본
+1.5x 격차의 정체가 바로 이것이다.
+
+row 캐싱은 외부 루프에서 단 N 번(= 25번) 만 `A[i]`, `B[i]` 를 수행하고, 그 결과를
+지역 변수에 묶어 둔다. 내부 루프 N² 번은 이 지역 변수만 읽으면 된다.
+
+---
+
+### 5. `normalize_label` — dict 로 매핑하는 이유
+
+```python
+# data_loader.py
+_LABEL_MAP = {
+    "+": "Cross",
+    "cross": "Cross",
+    "x": "X",
+}
+
+def normalize_label(label):
+    if label is None:
+        raise ValueError("라벨이 None 입니다.")
+    key = str(label).strip().lower()
+    if key in _LABEL_MAP:
+        return _LABEL_MAP[key]
+    raise ValueError(f"알 수 없는 라벨: {label!r}")
+```
+
+**왜 `str(label).strip().lower()` 인가?**
+
+입력이 JSON 에서 왔으므로 이론상 문자열이지만, 방어적으로 `str()` 로 감싼다. 그 뒤:
+
+- `.strip()` — `" Cross "` 같은 실수로 들어온 양끝 공백 제거
+- `.lower()` — `Cross`, `cross`, `CROSS` 를 모두 `cross` 로 통일 → **3개의 if/elif 대신 dict 한 개로 처리 가능**
+
+```
+ "+"       → strip → lower → "+"       → _LABEL_MAP["+"]      → "Cross"
+ " Cross " → strip → lower → "cross"   → _LABEL_MAP["cross"]  → "Cross"
+ "X"       → strip → lower → "x"       → _LABEL_MAP["x"]      → "X"
+ "plus"    → strip → lower → "plus"    → KeyError → ValueError
+```
+
+**왜 if/elif 체인이 아니라 dict 인가?**
+
+- 조회가 **O(1)** (if/elif 는 선형 탐색)
+- 새 별명을 추가할 때 함수 본문이 아니라 데이터(상수 dict)만 바꾸면 됨
+- 한눈에 보이는 "어떤 입력이 어디로 가는지" 매핑 테이블 역할
+
+**왜 알 수 없는 라벨에 `ValueError` 를 던지는가?**
+
+호출자(`load_patterns`)가 어떻게 처리할지 결정하도록 **의사결정을 위임** 하기 위해서다.
+단순히 `"Unknown"` 같은 값을 리턴하면 호출자가 그 문자열을 다시 해석해야 하는데,
+예외는 "여기서 실패했다" 가 타입 시스템에 강제된다. 현재 mode2 는 이 예외를 데이터 로드
+단계의 치명적 오류로 처리한다 (자세한 건 "결과 리포트 > 분석 — FAIL 원인" 참고).
+
+---
+
+### 6. dispatch 메커니즘 — `set_version()` 이 어떻게 전체 동작을 바꾸는가
+
+```python
+# mac.py
+VERSIONS = ("baseline", "sumprod", "bitwise")
+_current_version = "baseline"   # ← 모듈 전역 상태
+
+_DISPATCH_2D = {
+    "baseline": _mac_2d_baseline,
+    "sumprod":  _mac_2d_sumprod,
+    "bitwise":  _mac_2d_bitwise,
+}
+
+def set_version(name):
+    global _current_version
+    if name not in VERSIONS:
+        raise ValueError(f"알 수 없는 MAC 버전: {name!r}")
+    _current_version = name
+
+def mac_2d(A, B):
+    return _DISPATCH_2D[_current_version](A, B)
+```
+
+mode1, mode2, benchmark 는 모두 `mac.mac_2d(A, B)` 만 호출한다.
+사용자가 메뉴 4번에서 `sumprod` 를 선택하면:
+
+```
+ [사용자 입력] "2" (sumprod 선택)
+       │
+       ▼
+ main._select_version()
+       │
+       ▼
+ mac.set_version("sumprod")
+       │
+       ├─ _current_version = "sumprod"   (모듈 전역 변수 교체)
+       │
+       ▼
+ 다음부터 어디서든 mac.mac_2d(A, B) 호출 시:
+       ├─ _DISPATCH_2D["sumprod"] 조회
+       ├─ _mac_2d_sumprod 함수 객체 반환
+       └─ 그 함수가 실제 실행
+```
+
+이것을 디자인 패턴 이름으로 부르면 **Strategy Pattern** 이다. 장점:
+
+- **호출자 코드 무수정**: mode1/mode2/benchmark 어디에도 `if version == "baseline" then ... else ...` 같은 분기가 없다. 전역 dispatch 표가 모든 분기를 흡수한다.
+- **테스트 용이**: 특정 버전을 테스트할 때 `mac.set_version("baseline")` 한 줄이면 끝.
+- **새 버전 추가 쉬움**: `_DISPATCH_2D` 에 키·값 한 쌍 더하고 `VERSIONS` 에 이름만 넣으면 UI 메뉴까지 자동 반영.
+
+트레이드오프: **전역 상태이므로 스레드 안전하지 않다.** 스레드 A 가 `set_version("bitwise")`
+를 부른 직후 스레드 B 가 `mac_2d()` 를 호출하면 B 도 bitwise 를 쓴다. 이 프로젝트는
+단일 스레드 REPL 이라 문제없지만, 멀티스레드 환경으로 가려면 버전을 인자로 받는
+`mac_2d_with(version, A, B)` 를 쓰는 게 맞다 (그래서 benchmark 는 이 변형을 쓴다).
+
+---
+
+### 요약 — 이 여섯 함수가 보여주는 설계 아이디어
+
+| 함수 | 핵심 기법 | 왜 흥미로운가 |
+|---|---|---|
+| `pack_grid` | 비트 시프트 + OR | 2D → 0차원(단일 int) 압축, 하드웨어 병렬의 준비 단계 |
+| `mac_packed` | AND + POPCNT | MAC 전체를 두 기계어 명령으로 축소 |
+| `flatten` | 이중 리스트 컴프리헨션 | 파이썬 평탄화 관용구 + CPython 최적화 |
+| `_mac_2d_baseline` | row 로컬 변수 캐싱 | 한 줄 차이로 내부 루프 접근 횟수 절반 |
+| `normalize_label` | `.strip().lower()` + dict | 입력 다양성을 한 줄 정규화로 흡수 |
+| `set_version` / dispatch | Strategy pattern + 전역 상태 | 호출자 무수정으로 런타임 동작 교체 |
+
+이 여섯 개를 이해하면 이 프로젝트 소스의 80% 가 "기본형 + 어딘가에서 이 아이디어 중 하나를 빌려 쓴 것" 임이 보인다.
 
 ---
 
